@@ -133,6 +133,42 @@ if google_file and meta_file and keap_file:
             tab_viz, tab_data, tab_details = st.tabs(["📈 Visualizations", "📄 Summary Data", "🔍 Deep Dive Tables"])
 
             with tab_viz:
+                # --- NEW: TREND ANALYSIS ---
+                st.markdown("#### Revenue Trend over Time")
+                
+                if not all_matches.empty and 'OrderDateParsed' in all_matches.columns:
+                    # Filter out any rows with missing dates for the chart
+                    trend_df = all_matches.dropna(subset=['OrderDateParsed']).copy()
+                    
+                    if not trend_df.empty:
+                        # Control for Time Frequency
+                        col_trend1, col_trend2 = st.columns([1, 4])
+                        with col_trend1:
+                            time_freq = st.selectbox("Group By:", ["Weekly", "Monthly", "Daily"], index=0)
+                        
+                        # Resample logic
+                        freq_map = {"Weekly": "W", "Monthly": "M", "Daily": "D"}
+                        rule = freq_map[time_freq]
+                        
+                        # Group by Source and Time
+                        trend_grouped = (trend_df.set_index('OrderDateParsed')
+                                         .groupby([pd.Grouper(freq=rule), 'Source'])['OrderValue']
+                                         .sum()
+                                         .reset_index())
+                        
+                        # Plot Line Chart
+                        fig_trend = px.line(trend_grouped, x='OrderDateParsed', y='OrderValue', color='Source',
+                                            markers=True, title=f"Revenue Trend ({time_freq})",
+                                            labels={'OrderDateParsed': 'Date', 'OrderValue': 'Revenue (£)'},
+                                            color_discrete_map={'Google Ads': '#4285F4', 'Meta': '#1877F2'})
+                        st.plotly_chart(fig_trend, use_container_width=True)
+                    else:
+                        st.info("No order dates found in the data to plot trends.")
+                else:
+                    st.info("Orders must have 'OrderDate' to show trends.")
+
+                st.divider()
+
                 col_chart1, col_chart2 = st.columns(2)
                 
                 # Chart 1: Revenue by Source
@@ -156,8 +192,6 @@ if google_file and meta_file and keap_file:
                     fig_sales = px.bar(df_sales, x='Source', y='Sales', color='Source', text_auto=True,
                                        color_discrete_map={'Google Ads': '#4285F4', 'Meta': '#1877F2'})
                     st.plotly_chart(fig_sales, use_container_width=True)
-
-                st.divider()
                 
                 # Chart 3: Google Campaigns
                 if 'Campaign name' in google_merged.columns:
