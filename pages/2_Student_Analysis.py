@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import math
+from statistics import NormalDist
+from datetime import timedelta
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Student Progress & Booking Predictor", layout="wide")
@@ -40,7 +42,7 @@ def load_and_process_data(file):
     else:
         df['City'] = "Unknown"
 
-    # 3. Filter Outliers (Test accounts)
+    # 3. Filter Outliers (Test accounts) - Updated list or keep generic
     outlier_names = ['Student 2986', 'Student 765', 'Student 5307'] 
     df = df[~df['Contact Name'].isin(outlier_names)]
 
@@ -68,12 +70,12 @@ def load_and_process_data(file):
 
     return df
 
-# --- PREDICTION ENGINE ---
-def generate_predictions(df, avg_days, std_days, stage_from, stage_to, event_name):
+# --- PROBABILISTIC PREDICTION ENGINE ---
+def calculate_probabilistic_demand(df, avg_days, std_days, stage_from, stage_to, event_name, months_ahead=12):
     """
-    Predicts future dates for a specific stage based on the previous stage's date.
+    Calculates expected student count per month using Gaussian Distribution.
     """
-    # Filter for students who are at this exact stage (Have 'From' date, but missing 'To' date)
+    # 1. Identify Candidates
     candidates = df[
         (df['Calculated_Status'] == 'Active') & 
         (df[stage_from].notnull()) & 
@@ -81,30 +83,54 @@ def generate_predictions(df, avg_days, std_days, stage_from, stage_to, event_nam
     ].copy()
 
     if candidates.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
-    # Predict Date
-    # Logic: Previous Date + Average Duration
+    # 2. Calculate Predicted Date (Mean) for each student
     candidates['Predicted_Date'] = candidates[stage_from] + pd.to_timedelta(avg_days, unit='D')
     
-    # Calculate Confidence Window (Early/Late based on Standard Deviation)
-    candidates['Window_Start'] = candidates['Predicted_Date'] - pd.to_timedelta(std_days, unit='D')
-    candidates['Window_End'] = candidates['Predicted_Date'] + pd.to_timedelta(std_days, unit='D')
+    # 3. Probabilistic Distrubution
+    # Create a list of Month Start/End dates for the next X months
+    future_months = []
+    start_date = CURRENT_DATE.replace(day=1) # Start of current month
+    for i in range(months_ahead):
+        m_start = start_date + pd.DateOffset(months=i)
+        m_end = m_start + pd.DateOffset(months=1) - timedelta(seconds=1)
+        future_months.append((m_start, m_end))
 
-    # Filter out dates far in the past (e.g., more than 1 year overdue are likely dropouts/zombies)
-    # But keep recent overdue (last 3 months) as "Backlog"
-    backlog_cutoff = CURRENT_DATE - pd.Timedelta(days=90)
-    
-    # Label "Backlog" vs "Future"
-    def label_period(date):
-        if date < CURRENT_DATE:
-            return "Backlog (Overdue)"
-        return date.strftime('%Y-%m') # Year-Month
+    # We will accumulate "fractional students" here
+    monthly_load = {m[0].strftime('%Y-%m'): 0.0 for m in future_months}
+    monthly_load['Backlog'] = 0.0
 
-    candidates['Month_Year'] = candidates['Predicted_Date'].apply(label_period)
-    candidates['Event_Type'] = event_name
+    # Iterate through each student and distribute their probability
+    # Using timestamp conversion for NormalDist (since it works with floats)
+    for _, row in candidates.iterrows():
+        pred_ts = row['Predicted_Date'].timestamp()
+        std_dev_seconds = std_days * 24 * 3600
+        
+        # If std_dev is 0 or NaN (single data point), treat as spike
+        if pd.isna(std_dev_seconds) or std_dev_seconds == 0:
+            std_dev_seconds = 1 * 24 * 3600 # Default to 1 day spread if no history
+            
+        dist = NormalDist(mu=pred_ts, sigma=std_dev_seconds)
+
+        # Calculate prob for each month bucket
+        total_prob = 0
+        for m_start, m_end in future_months:
+            p = dist.cdf(m_end.timestamp()) - dist.cdf(m_start.timestamp())
+            monthly_load[m_start.strftime('%Y-%m')] += p
+            total_prob += p
+        
+        # Whatever probability is "left over" on the left side is Backlog
+        # (Technically some is far future, but for this window we assume left tail is backlog)
+        backlog_prob = dist.cdf(future_months[0][0].timestamp())
+        monthly_load['Backlog'] += backlog_prob
+
+    # Format Output
+    demand_df = pd.DataFrame(list(monthly_load.items()), columns=['Month_Year', 'Expected_Students'])
+    demand_df['Event_Type'] = event_name
+    demand_df['Classes_Needed_Prob'] = demand_df['Expected_Students'].apply(lambda x: math.ceil(x / 10))
     
-    return candidates[['Contact Name', 'Topic', 'Predicted_Date', 'Month_Year', 'Event_Type', 'Window_Start', 'Window_End']]
+    return demand_df
 
 # --- DASHBOARD LAYOUT ---
 st.title("🎓 Student Progress & Booking Predictor")
@@ -130,80 +156,72 @@ if uploaded_file:
         "🌍 Locations"
     ])
 
-    # --- TAB 1: BOOKING PREDICTOR ---
+    # --- TAB 1: BOOKING PREDICTOR (UPDATED) ---
     with tab1:
-        st.subheader("📅 Future Demand Forecaster")
-        st.markdown(
-            "This tool predicts when students will be ready for **Exams**, **Training**, and **Assessments** "
-            "based on historical averages. It assumes a class size of **10**."
-        )
+        st.subheader("📅 Future Demand Forecaster (Probabilistic)")
+        st.markdown("""
+        **How this works:**
+        Instead of guessing a single date, we use the **Gaussian Distribution** (Bell Curve) of your historical data.
+        If a student is predicted for March 31st but your timing varies by ±2 weeks, this model allocates 
+        50% of that student to March and 50% to April. This smoothes out the demand curve.
+        """)
 
-        # 1. Calculate Historical Averages (The "Model")
-        # We use the whole dataset (not filtered) to get robust averages
+        # 1. Calculate Historical Averages
         stats = {}
         for metric, col in [('Enrol->Exam', 'Days_Enrol_to_Exam'), 
                             ('Exam->Prac', 'Days_Exam_to_Prac'), 
                             ('Prac->Assess', 'Days_Prac_to_Assess')]:
             valid = df[df[col] > 0][col]
-            stats[metric] = {'mean': valid.mean(), 'std': valid.std()}
+            if len(valid) > 1:
+                stats[metric] = {'mean': valid.mean(), 'std': valid.std()}
+            else:
+                stats[metric] = {'mean': valid.mean() if not valid.empty else 30, 'std': 15}
 
-        # 2. Generate Predictions
-        # Exams: Enrolment -> Exam
-        pred_exams = generate_predictions(df_filtered, stats['Enrol->Exam']['mean'], stats['Enrol->Exam']['std'], 
+        # 2. Generate Probabilistic Predictions
+        pred_exams = calculate_probabilistic_demand(df_filtered, stats['Enrol->Exam']['mean'], stats['Enrol->Exam']['std'], 
                                           'Enrolment Date', 'Exam Start Date', 'Exams')
         
-        # Pracs: Exam -> Practical
-        pred_pracs = generate_predictions(df_filtered, stats['Exam->Prac']['mean'], stats['Exam->Prac']['std'], 
+        pred_pracs = calculate_probabilistic_demand(df_filtered, stats['Exam->Prac']['mean'], stats['Exam->Prac']['std'], 
                                           'Exam Start Date', 'Prac Start Date', 'Practical Training')
         
-        # Assess: Prac -> Assessment
-        pred_assess = generate_predictions(df_filtered, stats['Prac->Assess']['mean'], stats['Prac->Assess']['std'], 
+        pred_assess = calculate_probabilistic_demand(df_filtered, stats['Prac->Assess']['mean'], stats['Prac->Assess']['std'], 
                                            'Prac Start Date', 'Assessment Start Date', 'Assessments')
 
-        # Combine all predictions
         all_preds = pd.concat([pred_exams, pred_pracs, pred_assess])
 
         if not all_preds.empty:
-            # 3. Aggregate by Month
-            demand = all_preds.groupby(['Event_Type', 'Month_Year']).size().reset_index(name='Student_Count')
-            
-            # Calculate Classes Needed (Count / 10, rounded up)
-            demand['Classes_Needed'] = demand['Student_Count'].apply(lambda x: math.ceil(x / 10))
+            # Sort for Chart
+            all_preds['Sort_Key'] = all_preds['Month_Year'].apply(lambda x: '0000' if 'Backlog' in x else x)
+            all_preds = all_preds.sort_values(['Event_Type', 'Sort_Key'])
 
-            # Sort nicely (Handle 'Backlog' text vs Dates)
-            demand['Sort_Key'] = demand['Month_Year'].apply(lambda x: '0000' if 'Backlog' in x else x)
-            demand = demand.sort_values(['Event_Type', 'Sort_Key'])
-
-            # Display
+            # Display Data
             col_pred1, col_pred2 = st.columns([1, 2])
             
             with col_pred1:
                 st.write("#### Resource Requirements")
                 st.dataframe(
-                    demand[['Event_Type', 'Month_Year', 'Student_Count', 'Classes_Needed']], 
+                    all_preds[['Event_Type', 'Month_Year', 'Expected_Students', 'Classes_Needed_Prob']]
+                    .style.format({'Expected_Students': '{:.1f}'}),
                     hide_index=True,
                     use_container_width=True
                 )
             
             with col_pred2:
-                st.write("#### Demand Timeline")
-                # Filter out backlog for the chart to keep it clean
-                chart_data = demand[demand['Month_Year'] != 'Backlog (Overdue)']
+                st.write("#### Smoothed Demand Curve")
+                chart_data = all_preds[all_preds['Month_Year'] != 'Backlog']
                 if not chart_data.empty:
-                    fig_pred = px.bar(chart_data, x='Month_Year', y='Classes_Needed', 
+                    fig_pred = px.bar(chart_data, x='Month_Year', y='Expected_Students', 
                                       color='Event_Type', barmode='group',
-                                      title="Classes Needed per Month (Grouped by Event Type)",
-                                      labels={'Classes_Needed': 'Classes (Groups of 10)', 'Month_Year': 'Month'})
+                                      title="Expected Student Load (Gaussian Smoothed)",
+                                      labels={'Expected_Students': 'Expected Students', 'Month_Year': 'Month'})
                     st.plotly_chart(fig_pred, use_container_width=True)
                 else:
-                    st.info("No future demand found (all overdue or no active candidates).")
+                    st.info("No future demand found.")
             
-            # Confidence Info
-            st.info(f"**Model Confidence:**\n"
-                    f"- Exams: Avg {stats['Enrol->Exam']['mean']:.0f} days (±{stats['Enrol->Exam']['std']:.0f} days)\n"
-                    f"- Practicals: Avg {stats['Exam->Prac']['mean']:.0f} days (±{stats['Exam->Prac']['std']:.0f} days)\n"
-                    f"- Assessments: Avg {stats['Prac->Assess']['mean']:.0f} days (±{stats['Prac->Assess']['std']:.0f} days)")
-
+            st.info(f"**Model Parameters (Gaussian):**\n"
+                    f"- Exams: Mean {stats['Enrol->Exam']['mean']:.0f} days, StdDev ±{stats['Enrol->Exam']['std']:.0f} days\n"
+                    f"- Practicals: Mean {stats['Exam->Prac']['mean']:.0f} days, StdDev ±{stats['Exam->Prac']['std']:.0f} days\n"
+                    f"- Assessments: Mean {stats['Prac->Assess']['mean']:.0f} days, StdDev ±{stats['Prac->Assess']['std']:.0f} days")
         else:
             st.warning("Not enough data to generate predictions.")
 
@@ -226,9 +244,8 @@ if uploaded_file:
         fig_funnel = px.funnel(funnel_df, x='Count', y='Stage', title="Progression Flow")
         col_f2.plotly_chart(fig_funnel, use_container_width=True)
         
-        # Zombie Check
         zombies = df_filtered[df_filtered['Is_Zombie']]
-        st.error(f"⚠️ **Zombie Alert:** {len(zombies)} Active students have not logged in for >90 days and have no exam booked.")
+        st.error(f"⚠️ **Zombie Alert:** {len(zombies)} Active students have not logged in for >90 days.")
         with st.expander("View Zombie List"):
             st.dataframe(zombies[['Contact Name', 'Enrolment Date', 'Days_Since_Login', 'Topic', 'City']])
 
