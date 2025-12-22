@@ -70,63 +70,151 @@ def load_and_process_data(file):
 
     return df
 
-# --- PROBABILISTIC PREDICTION ENGINE ---
-def calculate_probabilistic_demand(df, avg_days, std_days, stage_from, stage_to, event_name, months_ahead=12):
+# --- CHAINED PREDICTION ENGINE ---
+def calculate_waterfall_demand(df, stats, months_ahead=18):
     """
-    Calculates expected student count per month using Gaussian Distribution.
-    Returns aggregated demand AND the raw student-level predictions.
+    Simulates the full future journey for every active student.
+    Returns aggregated demand per month for Exams, Practicals, and Assessments.
     """
-    # 1. Identify Candidates
-    candidates = df[
-        (df['Calculated_Status'] == 'Active') & 
-        (df[stage_from].notnull()) & 
-        (df[stage_to].isnull())
-    ].copy()
-
-    if candidates.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    # 2. Calculate Predicted Date (Mean) for each student
-    candidates['Predicted_Date'] = candidates[stage_from] + pd.to_timedelta(avg_days, unit='D')
-    candidates['Event_Type'] = event_name
     
-    # 3. Probabilistic Distrubution
+    # Define the Timeline Buckets
     future_months = []
-    start_date = CURRENT_DATE.replace(day=1) # Start of current month
+    start_date = CURRENT_DATE.replace(day=1)
     for i in range(months_ahead):
         m_start = start_date + pd.DateOffset(months=i)
         m_end = m_start + pd.DateOffset(months=1) - timedelta(seconds=1)
         future_months.append((m_start, m_end))
 
-    monthly_load = {m[0].strftime('%Y-%m'): 0.0 for m in future_months}
-    monthly_load['Backlog'] = 0.0
+    # Initialize Demand Grids
+    demand = {
+        'Exams': {m[0].strftime('%Y-%m'): 0.0 for m in future_months},
+        'Practical Training': {m[0].strftime('%Y-%m'): 0.0 for m in future_months},
+        'Assessments': {m[0].strftime('%Y-%m'): 0.0 for m in future_months}
+    }
+    
+    # Initialize Raw Data Collection
+    raw_predictions = []
 
-    for _, row in candidates.iterrows():
-        pred_ts = row['Predicted_Date'].timestamp()
-        std_dev_seconds = std_days * 24 * 3600
+    # Helper to distribute probability
+    def distribute_prob(date_ts, std_dev, target_dict):
+        if pd.isna(date_ts) or pd.isna(std_dev) or std_dev == 0:
+            std_dev = 1 * 24 * 3600 # Fallback 1 day
         
-        if pd.isna(std_dev_seconds) or std_dev_seconds == 0:
-            std_dev_seconds = 1 * 24 * 3600 
-            
-        dist = NormalDist(mu=pred_ts, sigma=std_dev_seconds)
-
+        dist = NormalDist(mu=date_ts, sigma=std_dev)
+        
         for m_start, m_end in future_months:
             p = dist.cdf(m_end.timestamp()) - dist.cdf(m_start.timestamp())
-            monthly_load[m_start.strftime('%Y-%m')] += p
-        
-        backlog_prob = dist.cdf(future_months[0][0].timestamp())
-        monthly_load['Backlog'] += backlog_prob
+            target_dict[m_start.strftime('%Y-%m')] += p
 
-    # Format Aggregated Output
-    demand_df = pd.DataFrame(list(monthly_load.items()), columns=['Month_Year', 'Expected_Students'])
-    demand_df['Event_Type'] = event_name
-    demand_df['Classes_Needed_Prob'] = demand_df['Expected_Students'].apply(lambda x: math.ceil(x / 10))
+    # --- PROCESS STUDENTS ---
+    # We iterate through active students and project their REMAINING steps
     
-    # Format Raw Data Output (Cleaned for display)
-    raw_df = candidates[['Contact Name', 'City', 'Topic', stage_from, 'Predicted_Date', 'Event_Type']].copy()
-    raw_df['Predicted_Month'] = raw_df['Predicted_Date'].dt.strftime('%Y-%m')
+    active_students = df[df['Calculated_Status'] == 'Active'].copy()
     
-    return demand_df, raw_df
+    for _, row in active_students.iterrows():
+        # Current State Tracking
+        curr_date = None
+        curr_std = 0 # Variance accumulates
+        
+        # Step 1: EXAMS
+        if pd.notnull(row['Exam Start Date']):
+            # Already done/booked
+            curr_date = row['Exam Start Date']
+            curr_std = 0 # Known date, no uncertainty
+        else:
+            # Predict Exam
+            if pd.notnull(row['Enrolment Date']):
+                mean_days = stats['Enrol->Exam']['mean']
+                std_days = stats['Enrol->Exam']['std']
+                
+                pred_exam_date = row['Enrolment Date'] + pd.to_timedelta(mean_days, unit='D')
+                curr_std = std_days * 24 * 3600
+                
+                # Add to Demand
+                distribute_prob(pred_exam_date.timestamp(), curr_std, demand['Exams'])
+                
+                # Store for Raw Data
+                raw_predictions.append({
+                    'Contact Name': row['Contact Name'],
+                    'Topic': row['Topic'],
+                    'City': row['City'],
+                    'Event_Type': 'Exams',
+                    'Predicted_Date': pred_exam_date
+                })
+                
+                # Update state for next step
+                curr_date = pred_exam_date
+            else:
+                continue # Cannot predict without enrolment date
+
+        # Step 2: PRACTICALS
+        if pd.notnull(row['Prac Start Date']):
+            # Already done/booked
+            curr_date = row['Prac Start Date']
+            curr_std = 0
+        elif curr_date is not None:
+            # Predict Practical (based on Exam Date - real or predicted)
+            mean_days = stats['Exam->Prac']['mean']
+            std_days = stats['Exam->Prac']['std']
+            
+            # Combine uncertainties: Var_total = Var_1 + Var_2 -> Std_total = Sqrt(Std1^2 + Std2^2)
+            # Simplified: Add variances
+            new_var = (curr_std**2) + ((std_days * 24 * 3600)**2)
+            curr_std = math.sqrt(new_var)
+            
+            pred_prac_date = curr_date + pd.to_timedelta(mean_days, unit='D')
+            
+            # Add to Demand
+            distribute_prob(pred_prac_date.timestamp(), curr_std, demand['Practical Training'])
+            
+            # Store for Raw Data
+            raw_predictions.append({
+                'Contact Name': row['Contact Name'],
+                'Topic': row['Topic'],
+                'City': row['City'],
+                'Event_Type': 'Practical Training',
+                'Predicted_Date': pred_prac_date
+            })
+            
+            # Update state
+            curr_date = pred_prac_date
+
+        # Step 3: ASSESSMENTS
+        if pd.notnull(row['Assessment Start Date']):
+            # Already done
+            pass
+        elif curr_date is not None:
+            # Predict Assessment (based on Practical Date - real or predicted)
+            mean_days = stats['Prac->Assess']['mean']
+            std_days = stats['Prac->Assess']['std']
+            
+            new_var = (curr_std**2) + ((std_days * 24 * 3600)**2)
+            curr_std = math.sqrt(new_var)
+            
+            pred_assess_date = curr_date + pd.to_timedelta(mean_days, unit='D')
+            
+            # Add to Demand
+            distribute_prob(pred_assess_date.timestamp(), curr_std, demand['Assessments'])
+            
+             # Store for Raw Data
+            raw_predictions.append({
+                'Contact Name': row['Contact Name'],
+                'Topic': row['Topic'],
+                'City': row['City'],
+                'Event_Type': 'Assessments',
+                'Predicted_Date': pred_assess_date
+            })
+
+    # Consolidate Results
+    final_df = pd.DataFrame()
+    for event_type, month_data in demand.items():
+        temp = pd.DataFrame(list(month_data.items()), columns=['Month_Year', 'Expected_Students'])
+        temp['Event_Type'] = event_type
+        final_df = pd.concat([final_df, temp])
+        
+    final_df['Classes_Needed_Prob'] = final_df['Expected_Students'].apply(lambda x: math.ceil(x / 10))
+    
+    return final_df, pd.DataFrame(raw_predictions)
 
 # --- DASHBOARD LAYOUT ---
 st.title("🎓 Student Progress & Booking Predictor")
@@ -139,13 +227,10 @@ if uploaded_file:
     # --- SIDEBAR FILTERS ---
     st.sidebar.header("Filters")
     
-    # Topic Filter
     topics = list(df['Topic'].unique())
     selected_topic = st.sidebar.multiselect("Select Topic", options=topics, default=topics)
     
-    # Location Filter (New)
     cities = sorted(list(df['City'].unique()))
-    # Default to all, but allow filtering
     selected_city = st.sidebar.multiselect("Select Location", options=cities, default=cities)
     
     # Apply Filters
@@ -164,164 +249,4 @@ if uploaded_file:
         "🌍 Locations"
     ])
 
-    # --- TAB 1: BOOKING PREDICTOR (UPDATED) ---
-    with tab1:
-        st.subheader("📅 Future Demand Forecaster (Probabilistic)")
-        
-        # 1. Calculate Historical Averages (Global Stats to keep model robust even if filtered)
-        stats = {}
-        for metric, col in [('Enrol->Exam', 'Days_Enrol_to_Exam'), 
-                            ('Exam->Prac', 'Days_Exam_to_Prac'), 
-                            ('Prac->Assess', 'Days_Prac_to_Assess')]:
-            valid = df[df[col] > 0][col] # Use full DF for stats
-            if len(valid) > 1:
-                stats[metric] = {'mean': valid.mean(), 'std': valid.std()}
-            else:
-                stats[metric] = {'mean': valid.mean() if not valid.empty else 30, 'std': 15}
-
-        # Display Model Parameters (The "X, Y, Z" times)
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Avg Time to Exam", f"{stats['Enrol->Exam']['mean']:.0f} Days", f"±{stats['Enrol->Exam']['std']:.0f} Days")
-        col_m2.metric("Avg Time to Practical", f"{stats['Exam->Prac']['mean']:.0f} Days", f"±{stats['Exam->Prac']['std']:.0f} Days")
-        col_m3.metric("Avg Time to Assessment", f"{stats['Prac->Assess']['mean']:.0f} Days", f"±{stats['Prac->Assess']['std']:.0f} Days")
-
-        # 2. Generate Predictions (on Filtered Data)
-        d1, r1 = calculate_probabilistic_demand(df_filtered, stats['Enrol->Exam']['mean'], stats['Enrol->Exam']['std'], 
-                                          'Enrolment Date', 'Exam Start Date', 'Exams')
-        
-        d2, r2 = calculate_probabilistic_demand(df_filtered, stats['Exam->Prac']['mean'], stats['Exam->Prac']['std'], 
-                                          'Exam Start Date', 'Prac Start Date', 'Practical Training')
-        
-        d3, r3 = calculate_probabilistic_demand(df_filtered, stats['Prac->Assess']['mean'], stats['Prac->Assess']['std'], 
-                                           'Prac Start Date', 'Assessment Start Date', 'Assessments')
-
-        all_preds = pd.concat([d1, d2, d3])
-        all_raw = pd.concat([r1, r2, r3])
-
-        if not all_preds.empty:
-            # Sort for Chart
-            all_preds['Sort_Key'] = all_preds['Month_Year'].apply(lambda x: '0000' if 'Backlog' in x else x)
-            all_preds = all_preds.sort_values(['Event_Type', 'Sort_Key'])
-
-            # Sub-Tabs for Chart vs Raw Data
-            subtab_chart, subtab_raw = st.tabs(["📊 Demand Chart", "📄 Raw Prediction Data"])
-            
-            with subtab_chart:
-                col_pred1, col_pred2 = st.columns([1, 3])
-                with col_pred1:
-                    st.write("#### Resource Plan")
-                    st.dataframe(
-                        all_preds[['Event_Type', 'Month_Year', 'Expected_Students', 'Classes_Needed_Prob']]
-                        .style.format({'Expected_Students': '{:.1f}'}),
-                        hide_index=True,
-                        use_container_width=True
-                    )
-                with col_pred2:
-                    st.write("#### Smoothed Demand Curve")
-                    chart_data = all_preds[all_preds['Month_Year'] != 'Backlog']
-                    if not chart_data.empty:
-                        fig_pred = px.bar(chart_data, x='Month_Year', y='Expected_Students', 
-                                          color='Event_Type', barmode='group',
-                                          title="Expected Student Load (Gaussian Smoothed)",
-                                          labels={'Expected_Students': 'Expected Students', 'Month_Year': 'Month'})
-                        st.plotly_chart(fig_pred, use_container_width=True)
-                    else:
-                        st.info("No future demand found.")
-
-            with subtab_raw:
-                st.write("#### Raw Student Predictions")
-                st.markdown("This list shows every student included in the prediction above, along with their **Predicted Date** based on the average time for their next stage.")
-                st.dataframe(
-                    all_raw.sort_values(['Event_Type', 'Predicted_Date']),
-                    hide_index=True,
-                    use_container_width=True
-                )
-        else:
-            st.warning("Not enough active students at these stages to generate predictions.")
-
-    # --- TAB 2: FUNNEL ---
-    with tab2:
-        st.subheader("Student Progression Funnel")
-        n_enrolled = len(df_filtered)
-        stages = {
-            'Enrolled': n_enrolled,
-            'Homework Completed': len(df_filtered[df_filtered['Homework Completed'] == 'Yes']),
-            'Exam Started': df_filtered['Exam Start Date'].notnull().sum(),
-            'Prac Started': df_filtered['Prac Start Date'].notnull().sum(),
-            'Assessment Started': df_filtered['Assessment Start Date'].notnull().sum()
-        }
-        funnel_df = pd.DataFrame(list(stages.items()), columns=['Stage', 'Count'])
-        funnel_df['% of Enrolled'] = (funnel_df['Count'] / n_enrolled * 100).round(1)
-        
-        col_f1, col_f2 = st.columns([1, 2])
-        col_f1.dataframe(funnel_df, hide_index=True)
-        fig_funnel = px.funnel(funnel_df, x='Count', y='Stage', title="Progression Flow")
-        col_f2.plotly_chart(fig_funnel, use_container_width=True)
-        
-        zombies = df_filtered[df_filtered['Is_Zombie']]
-        st.error(f"⚠️ **Zombie Alert:** {len(zombies)} Active students have not logged in for >90 days.")
-        with st.expander("View Zombie List"):
-            st.dataframe(zombies[['Contact Name', 'Enrolment Date', 'Days_Since_Login', 'Topic', 'City']])
-
-    # --- TAB 3: SPEED ANALYSIS ---
-    with tab3:
-        st.subheader("Time to Reach Milestones")
-        stats_speed = []
-        for stage, col in [('Enrolment -> Exam', 'Days_Enrol_to_Exam'), 
-                           ('Exam -> Practical', 'Days_Exam_to_Prac'),
-                           ('Practical -> Assessment', 'Days_Prac_to_Assess')]:
-            valid = df_filtered[df_filtered[col] > 0][col]
-            if not valid.empty:
-                stats_speed.append({
-                    'Stage': stage,
-                    'Average Days': valid.mean(),
-                    'Min': valid.min(),
-                    'Max': valid.max(),
-                    'Count': len(valid)
-                })
-        st.table(pd.DataFrame(stats_speed).style.format({'Average Days': '{:.1f}'}))
-
-    # --- TAB 4: COURSE DIFFICULTY ---
-    with tab4:
-        st.subheader("Topic Difficulty")
-        topic_stats = df_filtered.groupby('Topic').agg(
-            Enrolled=('Contact Name', 'count'),
-            Reached_Exams=('Exam Start Date', 'count'),
-            Avg_Days_Exam=('Days_Enrol_to_Exam', lambda x: x[x>0].mean())
-        ).reset_index()
-        topic_stats['Exam Rate (%)'] = (topic_stats['Reached_Exams'] / topic_stats['Enrolled'] * 100).round(1)
-        
-        fig_combo = go.Figure()
-        fig_combo.add_trace(go.Bar(x=topic_stats['Topic'], y=topic_stats['Reached_Exams'], name='Students at Exam'))
-        fig_combo.add_trace(go.Scatter(x=topic_stats['Topic'], y=topic_stats['Avg_Days_Exam'], name='Avg Days to Reach', yaxis='y2', mode='lines+markers'))
-        fig_combo.update_layout(yaxis2=dict(overlaying='y', side='right'))
-        st.plotly_chart(fig_combo, use_container_width=True)
-
-    # --- TAB 5: HOMEWORK IMPACT ---
-    with tab5:
-        st.subheader("Homework Impact on Success")
-        hw_stats = df_filtered.groupby('Homework Completed').apply(
-            lambda x: pd.Series({
-                'Total': len(x),
-                'Reached Practical': x['Prac Start Date'].notnull().sum()
-            })
-        ).reset_index()
-        hw_stats['Success Rate (%)'] = (hw_stats['Reached Practical'] / hw_stats['Total'] * 100).round(1)
-        
-        fig_hw = px.bar(hw_stats, x='Homework Completed', y='Success Rate (%)', 
-                        color='Homework Completed', text='Success Rate (%)',
-                        title="Likelihood of Reaching Practicals based on Homework")
-        st.plotly_chart(fig_hw, use_container_width=True)
-
-    # --- TAB 6: LOCATION ---
-    with tab6:
-        st.subheader("Geographic Breakdown")
-        loc_counts = df_filtered['City'].value_counts().reset_index()
-        loc_counts.columns = ['City', 'Count']
-        loc_counts = loc_counts[loc_counts['City'] != "Unknown"]
-        fig_loc = px.bar(loc_counts.head(20), x='Count', y='City', orientation='h', title="Top Student Locations")
-        fig_loc.update_layout(yaxis={'categoryorder':'total ascending'})
-        st.plotly_chart(fig_loc, use_container_width=True)
-
-else:
-    st.info("👋 Welcome! Please upload your 'Learner Progress Report' CSV or Excel file to begin.")
+    # --- TAB 1: BOOKING PREDICTOR (WATER
